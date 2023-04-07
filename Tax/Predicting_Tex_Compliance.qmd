@@ -1,0 +1,366 @@
+---
+title: "Predicting Tax Compliance"
+author: "Runqi Liu"
+date: "04/06/2023"
+format:
+  html: 
+    theme: "pulse"
+    self-contained: true
+    embed-resources: true
+fig-asp: 0.618
+fig-width: 10
+---
+In this project I will work with data from Malawi on tax compliance. The goal is to predict whether a market vendor reports paying a market tax or not based on a large number of demographic variables.
+
+The data, contained in data/vendor_data.RData, come from a project Dr. Simon Hoellerbauer has been working on that analyzes a randomized control trial (RCT) focused on tax compliance carried out in Malawi. In Malawi, market vendors have to pay a fee (a flat tax) in order to be able to sell goods or services in a market. This fee is collected by fee collectors, who make the rounds each day. Compliance is not optimal for a variety of reasons, a main one being that markets are underfunded and so are often in poor conditions. This causes market vendors to not want to pay the market tax, which in turn makes it harder for the government to improve the markets (this is called a vicious cycle). The RCT ran from October 2017 to March 2019 in 128 markets in 8 districts in Malawi. The goal of the RCT was to investigate different ways to break out of this vicious cycle in Malawian markets.
+
+The data was collected via an in-person survey of market vendors carried out between October 2018 and January 2019. In total, 12,370 market vendors completed the survey. 2,531 of these vendors were asked a longer form of the survey, with more questions. We will be working with the responses from these individuals for this homework.
+
+The key outcome is recent_receipt_7. This captures whether a respondent was able to present a receipt for paying taxes (which fee collectors are supposed to hand out after receiving the market tax) to their interviewer. It is a binary variable.
+
+## Codebook
+```{r}
+#| message: false
+library(glue)
+library(tidyverse)
+```
+
+```{r echo=FALSE}
+load("data/vendor_data.RData")
+
+get_levels_string <- function(column, collapse = ", ", ital = T){
+  lvl_str <- paste(levels(vendor_data[[column]]), collapse = collapse)
+  
+  if(isTRUE(ital)) lvl_str <- paste0("*", lvl_str, "*")
+  
+  lvl_str
+}
+
+langs <- get_levels_string("language")
+tribes <- get_levels_string("tribe")
+lit <- get_levels_string("literacy")
+read_langs <- get_levels_string("reading_language")
+profit_comp <- get_levels_string("profit_lst_yr_month")
+stalls <- get_levels_string("stall_type", collapse = "; ")
+
+codebook <- tibble(
+  Variables = paste0("`", names(vendor_data), "`"),
+  Description = c("Market ID of respondent's market",
+                  "District ID of district where respondent's market is located",
+                  "Language in which survey was carried out",
+                  "Is respondent female or not (Note: assessed by interviewer)",
+                  "Respondent's age",
+                  "Respondent's tribe",
+                  "Is respondent married?",
+                  "Maximum level of education completed by respondent",
+                  "Numeric version of education variable",
+                  "How well respondent was able to read a cue card. Used as a measure of literacy.",
+                  "Language in which respondent wanted to read cue card",
+                  "How many houses are owned by respondent's household",
+                  "How many acres of farmland are owned by respondent's household",
+                  "How many bicycles are owned by respondent's household",
+                  "How many chickens are owned by respondent's household",
+                  "How many goats are owned by respondent's household",
+                  "How many basic cell phones are owned by the respondent's household",
+                  "How many smart phones are owned by the respondent's household",
+                  "How many days a week respondent sells at this market",
+                  "Does vendor sell services or goods",
+                  "How many years respondent has sold at this market",
+                  "Respondent's average daily profit (in Malawian kwacha)",
+                  "How their profit this month compares to their profit this month last year",
+                  "Respondent's household income (Note: this has been 99th percentile trimmed, where extreme values higher than the 99th percentile are dropped, as a way to reduce outliers. (Malawian kwacha)",
+                  "How many customers respondent has a day, on average (Note: 99th percentile trimmed)",
+                  "A description of the respondent's stall (spot in the market)",
+                  "Does respondent intend to vote in 2019 presidential election?",
+                  "Did respondent show enumerator from within past 7 days?",
+                  "Should this be part of the test set for question 6?"),
+  Value = c("Numeric 1 to 128 for privacy reasons, but represents a categorical value. **Note**: You will have to turn this into a factor/categorical variable, or **scikit-learn will get confused**!",
+            "Numeric 1 to 8 for privacy reasons, but represents a categorical value. **Note**: You will have to turn this into a factor/categorical variable, or **scikit-learn will get confused**!",
+            glue("Factor with levels {langs}"),
+            "Binary. 1 = Female, 0 = Not Female",
+            "Numeric",
+            glue("Factor with levels {tribes}"),
+            "Binary. 1 = Yes, 0 = No",
+            "Factor with 18 levels from 'None' to 'PhD'",
+            "Because `education` is ordered, this roughly captures how educated respondent is numerically. Note that it does not quite correspond to how many years of education a respondent has completed.",
+            glue("Factor with levels {lit}"),
+            glue("Factor with levels {read_langs}"),
+            rep("Numeric", 7),
+            "Numeric",
+            "Binary. 1 = Service, 0 = Good",
+            "Numeric",
+            "Numeric",
+            glue("Factor with levels {profit_comp}"),
+            "Numeric",
+            "Numeric",
+            glue("Factor with levels {stalls}"),
+            "Binary. 1 = Yes, 0 = No",
+            "Binary. 1 = Yes, 0 = No",
+            "Binary. 1 = Test, 0 = Training")
+)
+
+knitr::kable(codebook)
+```
+## Packages
+
+```{r r_packages}
+#| message: false
+library(reticulate)
+library(tidyverse)
+library(ggplot2)
+```
+
+```{python python_packages}
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.compose import make_column_transformer
+from sklearn.model_selection import cross_val_predict, train_test_split, GridSearchCV, StratifiedShuffleSplit
+from sklearn.datasets import make_regression
+from sklearn.metrics import roc_auc_score
+from sklearn.kernel_approximation import Nystroem
+from sklearn.linear_model import SGDClassifier
+from sklearn.ensemble import GradientBoostingClassifier
+```
+
+## Data Visualization
+```{r outcome and one predictor}
+load('data/vendor_data.RData')
+
+# convert the recent_receipt column into categorical column
+vendor_data$recent_receipt_7 <- factor(vendor_data$recent_receipt_7)
+
+# creating bar plot that reflects the relationship between stall type and receipt status
+ggplot(vendor_data, aes(x = stall_type, fill = recent_receipt_7, group = recent_receipt_7)) +
+  geom_bar(width = 0.5) +
+  labs(title = "Relationship between Stall Type and Receipt Status",
+       x = "Stall Type",
+       y = "Count",
+       fill = "Recent Receipt") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))+
+  scale_fill_manual(labels = c("No", "Yes"), values = c("blue", "red"))
+```
+
+```{r two predictors}
+#| warning: false
+# creating a plot that reflects the relationship between customers per daya the profit
+ggplot(vendor_data, aes(x = customers_pr_day_trim_99, y = profit)) +
+  geom_smooth(method=lm) +
+  labs(title = "Relationship between Customers per day and Profit",
+       x = "Customers per Day",
+       y = "Profit") +
+  theme_bw()
+```
+
+
+## Train-Test Split
+```{python}
+# drop NAs from the data and converting the data set into a pandas data frame
+vendor = r.vendor_data.dropna()
+vendor = pd.DataFrame(vendor)
+
+# create X and y
+X = vendor.drop(['recent_receipt_7', 'unequal_test', 'market'], axis=1)
+y = np.ravel(vendor['recent_receipt_7'])
+
+# create a train-test split
+X_train, X_test, y_train, y_test = train_test_split(
+  X,
+  y,
+  test_size = 0.25,
+  random_state = 20
+)
+```
+In this code chunk, I dropped all NAs because missing values can cause issues when fitting models because many algorithms are not able to handle missing data.
+
+## Support Vector Machine
+Find the optimal support vector machine for predicting a recent receipt using all of our variables.
+```{python}
+categorical_cols = ['language', 'district', 'tribe','education','literacy','reading_language','profit_lst_yr_month','stall_type']
+binary_cols = ['female', 'married', 'vote_intend', 'service']
+numeric_cols = list(X.columns)
+numeric_cols = [c for c in numeric_cols if c not in binary_cols]
+numeric_cols = [c for c in numeric_cols if c not in categorical_cols]
+
+# create a preprocessor
+preprocessor = make_column_transformer(
+  (OneHotEncoder(drop="if_binary"), categorical_cols),
+  (StandardScaler(), numeric_cols),
+  remainder = "passthrough",
+  verbose_feature_names_out = False
+  )
+
+# Set ranges for the hyperparameters
+alpha_range = np.logspace(-4, 4, 10)
+gamma_range = np.logspace(-4, 4, 10)
+kernels = ['rbf', 'linear']
+
+# Set the hyperparameters to be tuned in a dictionary
+param_grid_svm = dict(
+  kernel_approx__gamma=gamma_range, kernel_approx__kernel = kernels,
+  estimator__alpha = alpha_range
+)
+
+# Set the cross-validation object
+cv = StratifiedShuffleSplit(n_splits=5, random_state = 100)
+
+# Create a pipeline object that applies the preprocessor, kernel approximation, and the SGDClassifier estimator
+pipeline_svm = Pipeline(
+  [
+    ('preprocess', preprocessor), 
+    ('kernel_approx', Nystroem()),
+    ('estimator', SGDClassifier(loss = 'hinge', random_state = 102))
+  ]
+)
+
+# Perform grid search with cross-validation
+grid_svm = (
+  GridSearchCV(pipeline_svm, param_grid=param_grid_svm, cv=cv, scoring='roc_auc')
+  .fit(X_train, y_train)
+)
+
+# Print the best hyperparameters and the corresponding AUC score
+print(
+    "The best parameters are %s, with a score of %0.2f"
+    % (grid_svm.best_params_, grid_svm.best_score_)
+)
+```
+We can use ROC curve AUC because it is a measure of the classifier's ability to correctly classify positive and negative samples, regardless of the threshold used to make the classification decision.
+
+```{python}
+# calculating overall AUC
+roc_auc_overall = roc_auc_score(y_test, grid_svm.best_estimator_.decision_function(X_test))
+
+# spliting test data into married and unmarried groups
+X_test_married = X_test.loc[X_test['married']==1]
+X_test_unmarried = X_test.loc[X_test['married']==0]
+y_test_married = y_test[X_test['married']==1]
+y_test_unmarried = y_test[X_test['married']==0]
+
+# calculating married AUC
+roc_auc_married = roc_auc_score(y_test_married, grid_svm.best_estimator_.decision_function(X_test_married))
+
+# calculating unmarried AUC
+roc_auc_unmarried = roc_auc_score(y_test_unmarried, grid_svm.best_estimator_.decision_function(X_test_unmarried))
+
+print(
+    f'The AUC on the overall test set is {roc_auc_overall}. The AUC on the married subsample is  {roc_auc_married}. The AUC on the unmarried subsample is {roc_auc_unmarried}.'
+)
+
+```
+Yes, the AUC for the subsample of the test set who are married is different from that for the subsample who are not married. This could mean that there is a different relationship between the predictor variables and the target variable for those who are married vs. those who are not.
+
+
+## Gradient Boosting Machine
+Find the optimal gradient boosting machine for predicting a recent receipt using all of our variables.
+```{python}
+# setting parameters
+b = np.arange(5000, 8000, 1000)
+lamb = [0.001, 0.01]
+d = np.arange(1, 3)
+
+param_grid_gbm = dict(
+  gbm__n_estimators = b,
+  gbm__learning_rate = lamb,
+  gbm__max_depth = d
+)
+
+# creating a pipeline
+pipeline_gbm = Pipeline(
+  [
+    ('preprocess', preprocessor), 
+    ('gbm', GradientBoostingClassifier(random_state = 0, subsample = 0.5))
+  ]
+)
+
+# Perform grid search with cross-validation
+grid_gbm = (
+  GridSearchCV(pipeline_gbm, 
+              param_grid=param_grid_gbm, 
+              cv=cv, 
+              scoring='roc_auc').fit(X_train, y_train)
+)
+```
+
+```{python}
+print(
+    "The best parameters are %s with a score of %0.2f"
+    % (grid_gbm.best_params_, grid_gbm.best_score_)
+)
+
+roc_auc_gbm = roc_auc_score(y_test, grid_gbm.best_estimator_.decision_function(X_test))
+print(f'The AUC on the overall test set is {roc_auc_gbm}.')
+```
+This AUC is higher than the AUC for SVM. Therefore, GBM does better at predicting on unseen data.
+
+## With Not Randomly Selected Training Data
+For this question, we will be working with a different train-test split. Split up the data into X_train_new, X_test_new, y_train_new, and y_test_new based on the unequal_test column. If this variable = 1, then it should go into the new test set.
+I picked GBM that produced the best performance on the test data. Find the best model of this kind using the new training data again using grid search.
+```{python}
+# Split up the data into X_train_new, X_test_new, y_train_new, and y_test_new based on the unequal_test column
+vendor_1 = vendor[vendor["unequal_test"] == 1]
+vendor_0 = vendor[vendor["unequal_test"] == 0]
+
+X_train_new = vendor_0.drop(["recent_receipt_7", "unequal_test", "market"], axis = 1)
+X_test_new = vendor_1.drop(["recent_receipt_7", "unequal_test", "market"], axis = 1)
+y_train_new = np.ravel(vendor_0["recent_receipt_7"])
+y_test_new = np.ravel(vendor_1["recent_receipt_7"])
+
+# Perform grid search with cross-validation
+grid_gbm_new = (
+  GridSearchCV(pipeline_gbm, param_grid=param_grid_gbm, cv=cv,
+  scoring = 'roc_auc')
+  .fit(X_train_new, y_train_new)
+)
+
+print(
+    "The best parameters are %s with a score of %0.2f"
+    % (grid_gbm_new.best_params_, grid_gbm_new.best_score_))
+
+# calculating the AUC on the new data
+roc_auc_gbm_new = roc_auc_score(y_test_new, grid_gbm_new.best_estimator_.decision_function(X_test_new))
+print(
+    f'The AUC on the data the model hasn’t seen yet is {roc_auc_gbm_new}.'
+)
+```
+This seems worse than the overall test AUC when we randomly split our data into test and training sets. 
+It might be because the training and testing subsets have significantly different distributions for some variables, then the model may not be able to generalize well to the testing subset, resulting in a lower AUC. Also, the new training data set has a smaller size than the old training set, then there may not be enough data to train the model effectively, resulting in a lower AUC.
+This implies that it is important to ensure that the training and testing subsets have a similar distribution of data to ensure that the model can generalize well to new data.
+```{python}
+# Define a function to calculate the proportion
+def calculate_proportion(group):
+    group['prop'] = group['n'] / group['n'].sum()
+    return group
+
+# language
+language = (vendor.groupby(['unequal_test', 'language'])
+      .size().reset_index(name='n')
+      .groupby('unequal_test').apply(calculate_proportion))
+
+# district
+district = (vendor.groupby(['unequal_test', 'district'])
+      .size().reset_index(name='n')
+      .groupby('unequal_test').apply(calculate_proportion))
+
+# stall_type
+stall_type = (vendor.groupby(['unequal_test', 'stall_type'])
+      .size().reset_index(name='n')
+      .groupby('unequal_test').apply(calculate_proportion))
+
+print(language)
+print(district)
+print(stall_type)
+```
+District is the most unbalanced variable. Many categories in this variable are very unbalanced in the train and test sets.
+
+## Introspection
+There could be several downsides to predicting whether a Malawian market vendor will pay the market tax or not. Here are some potential downsides:
+
+Privacy concerns: Predicting whether someone will pay a tax or not could involve collecting and analyzing personal data. This could raise concerns around privacy and the ethical use of personal information.
+
+Unintended consequences: The prediction of whether someone will pay a tax or not could lead to unintended consequences. For example, vendors who are predicted not to pay the tax may be targeted by the government or face increased scrutiny, even if they intend to pay the tax.
+
+Overall, prediction of this kind could have both positive and negative consequences. While it could potentially help the government identify shirkers and increase revenue, it could also raise concerns around privacy, biases, and unintended consequences. It is important to weigh these factors carefully and consider the potential impact on all stakeholders before implementing such a prediction task.
